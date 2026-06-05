@@ -27,7 +27,7 @@ build/
 # Logs & DB
 *.log
 *.sqlite
-*.db
+data/wallets.db
 
 # Claude
 .claude/

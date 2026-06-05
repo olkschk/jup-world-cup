@@ -17,10 +17,8 @@ logging.basicConfig(
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 
-# MongoDB
-MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
-MONGO_DB = os.getenv("MONGO_DB", "jupiterworldcup")
-MONGO_COLLECTION = os.getenv("MONGO_COLLECTION", "wallets")
+# SQLite
+DB_FILE = DATA_DIR / os.getenv("DB_FILE", "wallets.db")
 
 # Solana
 SOLANA_RPC = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com")

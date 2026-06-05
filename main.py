@@ -1,27 +1,17 @@
-"""Main runner.
-
-Sequential mode (no proxies):
-    Wallets are processed one by one with random delays between actions.
-
-Parallel mode (proxies present):
-    Up to MAX_WORKERS wallets run simultaneously, each through its own proxy
-    (assigned round-robin). Random delays are still applied inside each thread.
-
-Re-run behaviour:
-    DONE        → skipped
-    LOW BALANCE → retried (maybe topped up)
-    ERROR       → retried
+"""Jupiter World Cup Freeroll Bot
 
 Usage:
-    python main.py
+    python main.py init    — load wallets from data/seeds.txt or data/privatekeys.txt
+    python main.py run     — place freeroll bets for all pending wallets
+    python main.py stats   — show statistics and low-balance wallets
 """
 from __future__ import annotations
 
 import logging
 import random
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
 from typing import Optional
 
 from config import (
@@ -35,6 +25,8 @@ from db import (
     STATUS_DONE,
     STATUS_LOW_BALANCE,
     STATUS_PENDING,
+    get_stats,
+    init_db,
     pending_wallets,
     set_error,
     set_status,
@@ -70,34 +62,30 @@ def rand_sleep(label: str) -> None:
 
 
 def _parse_proxy(raw: str) -> str:
-    """Normalise a proxy string to a full URL.
+    """Normalise any proxy format to a full URL.
 
-    Supported input formats:
-      ip:port                            → http://ip:port
-      ip:port:login:password             → http://login:password@ip:port
-      http://ip:port                     → unchanged
-      http://ip:port:login:password      → http://login:password@ip:port
-      http://user:pass@host:port         → unchanged
-      socks5://user:pass@host:port       → unchanged
+    Supported:
+      ip:port                       → http://ip:port
+      ip:port:login:password        → http://login:password@ip:port
+      http://ip:port                → unchanged
+      http://ip:port:login:password → http://login:password@ip:port
+      http://user:pass@host:port    → unchanged
+      socks5://...                  → unchanged
     """
-    # Split scheme from the rest (default to http)
     if "://" in raw:
         scheme, rest = raw.split("://", 1)
     else:
         scheme, rest = "http", raw
 
-    # Already in user:pass@host:port form — reconstruct with scheme
     if "@" in rest:
         return f"{scheme}://{rest}"
 
     parts = rest.split(":")
-    if len(parts) == 2:
-        # host:port
-        return f"{scheme}://{rest}"
-    elif len(parts) == 4:
-        # host:port:login:password
+    if len(parts) == 4:
         host, port, login, password = parts
         return f"{scheme}://{login}:{password}@{host}:{port}"
+    elif len(parts) == 2:
+        return f"{scheme}://{rest}"
     else:
         logger.warning("Unrecognised proxy format, using as-is: %s", raw)
         return f"{scheme}://{rest}"
@@ -106,10 +94,8 @@ def _parse_proxy(raw: str) -> str:
 def load_proxies() -> list[str]:
     if not PROXIES_FILE.exists():
         return []
-    raw_lines = [l.strip() for l in PROXIES_FILE.read_text(encoding="utf-8").splitlines() if l.strip()]
-    proxies = [_parse_proxy(l) for l in raw_lines]
-    logger.debug("Loaded %d proxy/proxies", len(proxies))
-    return proxies
+    raw = [l.strip() for l in PROXIES_FILE.read_text(encoding="utf-8").splitlines() if l.strip()]
+    return [_parse_proxy(l) for l in raw]
 
 
 # ---------------------------------------------------------------------------
@@ -122,10 +108,9 @@ def process_wallet(doc: dict, idx: int, total: int, proxy: Optional[str] = None)
     short = address[:8] + "…" + address[-4:]
     prefix = f"[{idx}/{total}][{short}]"
     proxy_tag = f" via {proxy.split('@')[-1]}" if proxy else ""
-
     logger.info("%s Starting%s", prefix, proxy_tag)
 
-    # ── 1. Balance ───────────────────────────────────────────────────────────
+    # ── 1. Balance ──────────────────────────────────────────────────────────
     logger.info("%s Checking SOL balance…", prefix)
     try:
         balance = get_sol_balance(address)
@@ -136,9 +121,7 @@ def process_wallet(doc: dict, idx: int, total: int, proxy: Optional[str] = None)
 
     if balance < MIN_SOL_BALANCE:
         set_status(address, STATUS_LOW_BALANCE)
-        logger.warning(
-            "%s ⚠️  LOW BALANCE: %.6f SOL (min %.4f SOL)", prefix, balance, MIN_SOL_BALANCE
-        )
+        logger.warning("%s ⚠️  LOW BALANCE: %.6f SOL (min %.4f)", prefix, balance, MIN_SOL_BALANCE)
         return
 
     logger.info("%s ✔  Balance: %.6f SOL", prefix, balance)
@@ -168,7 +151,7 @@ def process_wallet(doc: dict, idx: int, total: int, proxy: Optional[str] = None)
 
     session = _session(address, proxy)
 
-    # ── 4. Register referral-code record ────────────────────────────────────
+    # ── 4. Register referral-code ────────────────────────────────────────────
     logger.info("%s Registering referral-code on server…", prefix)
     wallet_record: dict = {}
     try:
@@ -197,7 +180,7 @@ def process_wallet(doc: dict, idx: int, total: int, proxy: Optional[str] = None)
             logger.warning("%s ⚠️  apply_referral: %s — continuing", prefix, exc)
         rand_sleep("after referral")
 
-    # ── 6. Fetch events & select 5 markets ──────────────────────────────────
+    # ── 6. Markets ───────────────────────────────────────────────────────────
     logger.info("%s Fetching World Cup markets…", prefix)
     try:
         events = fetch_events()
@@ -214,7 +197,7 @@ def process_wallet(doc: dict, idx: int, total: int, proxy: Optional[str] = None)
     logger.info("%s Creating free parlay transaction…", prefix)
     try:
         tx_b64 = create_free_parlay(session, address, market_ids)
-        logger.info("%s ✔  Unsigned transaction received", prefix)
+        logger.info("%s ✔  Unsigned tx received", prefix)
     except Exception as exc:
         set_error(address, f"create_free_parlay: {exc}")
         logger.error("%s ❌ create_free_parlay failed: %s", prefix, exc)
@@ -237,7 +220,7 @@ def process_wallet(doc: dict, idx: int, total: int, proxy: Optional[str] = None)
     try:
         result = submit_free_parlay(session, address, market_ids, signed_tx)
         parlay_id = result.get("parlays", [{}])[0].get("parlayId", "?")
-        logger.info("%s ✅ Freeroll submitted! parlayId=%s", prefix, parlay_id)
+        logger.info("%s ✅ Submitted! parlayId=%s", prefix, parlay_id)
         set_status(address, STATUS_DONE, user_ref=user_ref if user_ref else None)
         logger.info("%s ✔  Status → DONE", prefix)
     except Exception as exc:
@@ -246,10 +229,16 @@ def process_wallet(doc: dict, idx: int, total: int, proxy: Optional[str] = None)
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# Commands
 # ---------------------------------------------------------------------------
 
-def main() -> None:
+def cmd_init() -> None:
+    from init_wallets import run_init
+    run_init()
+
+
+def cmd_run() -> None:
+    init_db()
     proxies = load_proxies()
     wallets = list(pending_wallets())
 
@@ -258,43 +247,33 @@ def main() -> None:
         return
 
     total = len(wallets)
-    mode = f"parallel (MAX_WORKERS={MAX_WORKERS})" if proxies else "sequential"
-
+    mode = f"parallel MAX_WORKERS={MAX_WORKERS}" if proxies else "sequential"
     logger.info("=" * 60)
     logger.info("Wallets: %d | Mode: %s | Proxies: %d", total, mode, len(proxies))
     logger.info("Delay per action: %d–%d s", DELAY_MIN, DELAY_MAX)
     logger.info("=" * 60)
 
     if proxies:
-        # Assign proxy round-robin; each thread runs one wallet
         tasks = [
             (doc, idx + 1, total, proxies[idx % len(proxies)])
             for idx, doc in enumerate(wallets)
         ]
-
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             futures = {
-                executor.submit(process_wallet, doc, idx, total, proxy): doc["address"]
-                for doc, idx, total, proxy in tasks
+                executor.submit(process_wallet, doc, idx, tot, proxy): doc["address"]
+                for doc, idx, tot, proxy in tasks
             }
             for future in as_completed(futures):
-                address = futures[future]
+                addr = futures[future]
                 try:
                     future.result()
                 except Exception as exc:
-                    logger.error("Unhandled error for %s: %s", address, exc)
+                    logger.error("Unhandled error for %s: %s", addr, exc)
     else:
-        # Sequential — no proxies
         for idx, doc in enumerate(wallets, 1):
-            address = doc["address"]
-            status = doc.get("status", STATUS_PENDING)
             logger.info("")
-            logger.info("── Wallet %d/%d ──────────────────────────────────────", idx, total)
-            logger.info("   Address : %s", address)
-            logger.info("   Status  : %s", status)
-
+            logger.info("── Wallet %d/%d: %s", idx, total, doc["address"])
             process_wallet(doc, idx, total, proxy=None)
-
             if idx < total:
                 rand_sleep(f"between wallets ({idx}/{total} done)")
 
@@ -304,5 +283,76 @@ def main() -> None:
     logger.info("=" * 60)
 
 
+def cmd_stats() -> None:
+    init_db()
+    s = get_stats()
+    total = s["total"]
+
+    def pct(n: int) -> str:
+        return f"{n / total * 100:.1f}%" if total else "—"
+
+    sep = "=" * 60
+    print(sep)
+    print("  STATISTICS")
+    print(sep)
+    print(f"  Total wallets : {total}")
+    print()
+
+    order = [STATUS_DONE, STATUS_PENDING, STATUS_LOW_BALANCE]
+    shown = set()
+    for status in order:
+        cnt = s["by_status"].get(status, 0)
+        print(f"  {status:<20} {cnt:>5}  ({pct(cnt)})")
+        shown.add(status)
+    # any ERROR or other statuses
+    for status, cnt in s["by_status"].items():
+        if status not in shown:
+            print(f"  {status[:20]:<20} {cnt:>5}  ({pct(cnt)})")
+
+    print()
+    print(f"  Referral applied : {s['user_ref_count']:>5}  ({pct(s['user_ref_count'])})")
+    print(sep)
+
+    lb = s["low_balance_wallets"]
+    if lb:
+        print(f"\n  LOW BALANCE wallets ({len(lb)}):")
+        print(f"  {'Address':<46}  Balance")
+        print("  " + "-" * 54)
+        for addr in lb:
+            try:
+                bal = get_sol_balance(addr)
+                bal_str = f"{bal:.6f} SOL"
+            except Exception:
+                bal_str = "— (RPC error)"
+            print(f"  {addr:<46}  {bal_str}")
+    else:
+        print("\n  No LOW BALANCE wallets.")
+
+    errs = s["error_wallets"]
+    if errs:
+        print(f"\n  ERROR wallets ({len(errs)}):")
+        print("  " + "-" * 54)
+        for addr, status in errs:
+            short_status = status[7:60] if status.startswith("ERROR:") else status
+            print(f"  {addr}  {short_status}")
+
+    print()
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+COMMANDS = {
+    "init": cmd_init,
+    "run": cmd_run,
+    "stats": cmd_stats,
+}
+
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
+        print(__doc__)
+        print(f"Available commands: {', '.join(COMMANDS)}")
+        sys.exit(1)
+
+    COMMANDS[sys.argv[1]]()
