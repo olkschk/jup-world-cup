@@ -69,11 +69,42 @@ def rand_sleep(label: str) -> None:
     time.sleep(delay)
 
 
+def _parse_proxy(raw: str) -> str:
+    """Normalise a proxy string to a full URL.
+
+    Supported input formats:
+      ip:port                       → http://ip:port
+      ip:port:login:password        → http://login:password@ip:port
+      http://host:port              → unchanged
+      http://user:pass@host:port    → unchanged
+      socks5://...                  → unchanged
+    """
+    # Already has a scheme prefix — return as-is
+    if "://" in raw:
+        return raw
+
+    parts = raw.split(":")
+    if len(parts) == 2:
+        # ip:port
+        host, port = parts
+        return f"http://{host}:{port}"
+    elif len(parts) == 4:
+        # ip:port:login:password
+        host, port, login, password = parts
+        return f"http://{login}:{password}@{host}:{port}"
+    else:
+        # Unknown format — pass through and let requests handle the error
+        logger.warning("Unrecognised proxy format, using as-is: %s", raw)
+        return raw
+
+
 def load_proxies() -> list[str]:
     if not PROXIES_FILE.exists():
         return []
-    lines = [l.strip() for l in PROXIES_FILE.read_text(encoding="utf-8").splitlines() if l.strip()]
-    return lines
+    raw_lines = [l.strip() for l in PROXIES_FILE.read_text(encoding="utf-8").splitlines() if l.strip()]
+    proxies = [_parse_proxy(l) for l in raw_lines]
+    logger.debug("Loaded %d proxy/proxies", len(proxies))
+    return proxies
 
 
 # ---------------------------------------------------------------------------
