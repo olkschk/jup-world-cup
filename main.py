@@ -73,29 +73,34 @@ def _parse_proxy(raw: str) -> str:
     """Normalise a proxy string to a full URL.
 
     Supported input formats:
-      ip:port                       → http://ip:port
-      ip:port:login:password        → http://login:password@ip:port
-      http://host:port              → unchanged
-      http://user:pass@host:port    → unchanged
-      socks5://...                  → unchanged
+      ip:port                            → http://ip:port
+      ip:port:login:password             → http://login:password@ip:port
+      http://ip:port                     → unchanged
+      http://ip:port:login:password      → http://login:password@ip:port
+      http://user:pass@host:port         → unchanged
+      socks5://user:pass@host:port       → unchanged
     """
-    # Already has a scheme prefix — return as-is
+    # Split scheme from the rest (default to http)
     if "://" in raw:
-        return raw
-
-    parts = raw.split(":")
-    if len(parts) == 2:
-        # ip:port
-        host, port = parts
-        return f"http://{host}:{port}"
-    elif len(parts) == 4:
-        # ip:port:login:password
-        host, port, login, password = parts
-        return f"http://{login}:{password}@{host}:{port}"
+        scheme, rest = raw.split("://", 1)
     else:
-        # Unknown format — pass through and let requests handle the error
+        scheme, rest = "http", raw
+
+    # Already in user:pass@host:port form — reconstruct with scheme
+    if "@" in rest:
+        return f"{scheme}://{rest}"
+
+    parts = rest.split(":")
+    if len(parts) == 2:
+        # host:port
+        return f"{scheme}://{rest}"
+    elif len(parts) == 4:
+        # host:port:login:password
+        host, port, login, password = parts
+        return f"{scheme}://{login}:{password}@{host}:{port}"
+    else:
         logger.warning("Unrecognised proxy format, using as-is: %s", raw)
-        return raw
+        return f"{scheme}://{rest}"
 
 
 def load_proxies() -> list[str]:
