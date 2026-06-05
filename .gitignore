@@ -1,0 +1,36 @@
+# Environment & secrets
+.env
+.env.local
+
+# Sensitive data files
+data/seeds.txt
+data/privatekeys.txt
+data/proxies.txt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Logs & DB
+*.log
+*.sqlite
+*.db
+
+# Claude
+.claude/
+
+# Network captures
+jup_ag_network_requests_full*.md
