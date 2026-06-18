@@ -1,9 +1,10 @@
 """Jupiter World Cup Freeroll Bot
 
 Usage:
-    python main.py init    — load wallets from data/seeds.txt or data/privatekeys.txt
-    python main.py run     — place freeroll bets for all pending wallets
-    python main.py stats   — show statistics and low-balance wallets
+    python main.py init     — load wallets from data/seeds.txt or data/privatekeys.txt
+    python main.py run      — place freeroll bets for all pending wallets
+    python main.py stats    — show statistics and low-balance wallets
+    python main.py results  — show per-wallet bet results (win/loss/pending)
 """
 from __future__ import annotations
 
@@ -20,15 +21,23 @@ from config import (
     PROXIES_FILE,
     REFERRAL_CODE,
 )
+from requests.exceptions import ProxyError
 from crypto_utils import decrypt
 from db import (
     STATUS_DONE,
     STATUS_LOW_BALANCE,
     STATUS_PENDING,
+    cache_event_score,
+    cache_slip,
+    done_wallets,
+    get_cached_score,
+    get_cached_slip,
     get_stats,
     init_db,
+    init_results_tables,
     pending_wallets,
     set_error,
+    set_is_lost,
     set_status,
     set_user_ref,
 )
@@ -36,7 +45,10 @@ from jupiter_api import (
     _session,
     apply_referral,
     create_free_parlay,
+    fetch_all_events_with_markets,
+    fetch_event_score,
     fetch_events,
+    fetch_wallet_slip,
     has_existing_slip,
     register_referral_code,
     select_markets,
@@ -202,9 +214,9 @@ def process_wallet(doc: dict, idx: int, total: int, proxy: Optional[str] = None)
         set_error(address, f"create_free_parlay: {exc}")
         logger.error("%s ❌ create_free_parlay failed: %s", prefix, exc)
         return
-    rand_sleep("after tx creation")
 
     # ── 8. Sign ─────────────────────────────────────────────────────────────
+    # No sleep between create/sign/submit — transaction validity window is short.
     logger.info("%s Signing transaction…", prefix)
     try:
         signed_tx = sign_transaction(tx_b64, keypair)
@@ -213,7 +225,6 @@ def process_wallet(doc: dict, idx: int, total: int, proxy: Optional[str] = None)
         set_error(address, f"sign_transaction: {exc}")
         logger.error("%s ❌ Signing failed: %s", prefix, exc)
         return
-    rand_sleep("after signing")
 
     # ── 9. Submit ────────────────────────────────────────────────────────────
     logger.info("%s Submitting freeroll…", prefix)
@@ -339,6 +350,190 @@ def cmd_stats() -> None:
     print()
 
 
+def cmd_results() -> None:
+    init_db()
+    init_results_tables()
+    proxies = load_proxies()
+    wallets = done_wallets()
+
+    if not wallets:
+        logger.info("No DONE wallets.")
+        print("No DONE wallets found.")
+        return
+
+    # Fetch all events (incl. closed) once — build market_id → result lookup
+    proxy0 = proxies[0] if proxies else None
+    logger.info("Fetching all events with market results…")
+    try:
+        all_events = fetch_all_events_with_markets(proxy0)
+    except Exception as exc:
+        logger.error("Failed to fetch events: %s", exc)
+        print(f"ERROR: could not fetch events: {exc}")
+        return
+
+    # market_id → {result, homeTeam, awayTeam, team}
+    # Use None (not "?") for missing team names so the `or` fallback to
+    # score_data works correctly in the display loop below.
+    market_lookup: dict[str, dict] = {}
+    for ev in all_events:
+        home = ev.get("homeTeam")
+        away = ev.get("awayTeam")
+        for mkt in ev.get("markets", []):
+            mid = mkt.get("marketId")
+            if mid:
+                team_val = mkt.get("team")
+                team_name = (
+                    team_val.get("name") if isinstance(team_val, dict) else team_val
+                )
+                market_lookup[mid] = {
+                    "result": mkt.get("result"),
+                    "homeTeam": home,
+                    "awayTeam": away,
+                    "team": team_name,
+                }
+    logger.info(
+        "Market lookup: %d markets across %d events", len(market_lookup), len(all_events)
+    )
+
+    total = len(wallets)
+    sep = "=" * 70
+    print(sep)
+    print("  RESULTS")
+    print(sep)
+
+    tally_won = tally_lost = tally_pending = 0
+    leg_wins = leg_losses = leg_pending = 0
+
+    for idx, doc in enumerate(wallets, 1):
+        address: str = doc["address"]
+        proxy = proxies[(idx - 1) % len(proxies)] if proxies else None
+        short = address[:8] + "…" + address[-4:]
+
+        # Slip — prefer cache, fall back to API
+        legs = get_cached_slip(address)
+        if legs is None:
+            for attempt_proxy in ([proxy, None] if proxy else [None]):
+                try:
+                    parlay_id, legs = fetch_wallet_slip(address, attempt_proxy)
+                    if legs:
+                        cache_slip(address, parlay_id, legs)
+                    break
+                except ProxyError:
+                    if attempt_proxy is None:
+                        logger.warning("Slip fetch failed without proxy for %s", short)
+                        legs = []
+                    else:
+                        logger.warning("Proxy 407 for %s, retrying without proxy", short)
+                except Exception as exc:
+                    logger.warning("Slip fetch failed for %s: %s", short, exc)
+                    legs = []
+                    break
+            if legs is None:
+                legs = []
+
+        if not legs:
+            print(f"\n  [{idx}/{total}] {short}  — no slip found")
+            continue
+
+        leg_rows: list[dict] = []
+        for leg in legs:
+            event_id: str = leg["eventId"]
+            market_id: str = leg["marketId"]
+
+            # Score — skip re-fetch if already cached as ended
+            cached_score = get_cached_score(event_id)
+            if cached_score and cached_score["ended"]:
+                score_data = cached_score
+            else:
+                score_data = cached_score  # fallback if all fetches fail
+                for attempt_proxy in ([proxy, None] if proxy else [None]):
+                    try:
+                        raw = fetch_event_score(event_id, attempt_proxy)
+                        if raw is not None:
+                            cache_event_score(event_id, raw)
+                            score_data = raw
+                        else:
+                            score_data = None
+                        break
+                    except ProxyError:
+                        if attempt_proxy is None:
+                            logger.warning("Score fetch failed without proxy %s", event_id)
+                        else:
+                            logger.debug("Proxy 407 for score %s, retrying without proxy", event_id)
+                    except Exception as exc:
+                        logger.warning("Score fetch failed %s: %s", event_id, exc)
+                        break
+
+            mkt_info = market_lookup.get(market_id, {})
+            result = mkt_info.get("result")
+
+            # score_data can come from fresh API (camelCase) or SQLite cache (snake_case)
+            sd = score_data or {}
+            home = (
+                sd.get("homeTeam") or sd.get("home_team")
+                or mkt_info.get("homeTeam")
+                or mkt_info.get("team")
+                or "?"
+            )
+            away = (
+                sd.get("awayTeam") or sd.get("away_team")
+                or mkt_info.get("awayTeam")
+                or "?"
+            )
+
+            if score_data:
+                score_str = score_data.get("score") or "—"
+                status_str = score_data.get("status") or ""
+            else:
+                score_str = "—"
+                status_str = "Not played yet"
+
+            icon = "✅" if result == "yes" else ("❌" if result == "no" else "⏳")
+            leg_rows.append(
+                {
+                    "icon": icon,
+                    "home": home,
+                    "away": away,
+                    "score": score_str,
+                    "status": status_str,
+                    "result": result,
+                }
+            )
+
+        wins = sum(1 for r in leg_rows if r["result"] == "yes")
+        losses = sum(1 for r in leg_rows if r["result"] == "no")
+        pending = sum(1 for r in leg_rows if r["result"] is None)
+
+        leg_wins += wins
+        leg_losses += losses
+        leg_pending += pending
+
+        if losses:
+            tally_lost += 1
+            set_is_lost(address)
+            continue  # skip display — lost wallets are filtered out
+
+        if pending:
+            parlay_icon = "⏳"
+            tally_pending += 1
+        else:
+            parlay_icon = "✅"
+            tally_won += 1
+
+        print(f"\n  [{idx}/{total}] {short}  {parlay_icon}  ({wins}W / {pending}⏳)")
+        for r in leg_rows:
+            print(f"    {r['icon']}  {r['home']} vs {r['away']}  {r['score']}  {r['status']}")
+
+    total_legs = leg_wins + leg_losses + leg_pending
+    print(f"\n{sep}")
+    print(f"  Parlay summary ({total} wallets):")
+    print(f"    ✅ All 5 won   = {tally_won:<4}  (parlay fully resolved as win)")
+    print(f"    ❌ Parlay lost = {tally_lost:<4}  (1+ leg lost → is_lost marked in DB)")
+    print(f"    ⏳ Still alive = {tally_pending:<4}  (no losses yet, awaiting results)")
+    print(f"  Individual legs ({total_legs} total):  ✅ {leg_wins}W  ❌ {leg_losses}L  ⏳ {leg_pending}P")
+    print(sep)
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -347,6 +542,7 @@ COMMANDS = {
     "init": cmd_init,
     "run": cmd_run,
     "stats": cmd_stats,
+    "results": cmd_results,
 }
 
 if __name__ == "__main__":

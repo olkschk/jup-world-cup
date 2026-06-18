@@ -16,9 +16,11 @@ import logging
 import random
 import time
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 from requests import HTTPError
+from requests.adapters import HTTPAdapter
 from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction
 
@@ -33,10 +35,40 @@ EVENTS_URL = (
     "&includeMarkets=true&includeAllMarkets=true"
 )
 
+EVENTS_CLOSED_URL = EVENTS_URL + "&includeClosed=true"
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+class _ProxyAuthAdapter(HTTPAdapter):
+    """HTTPAdapter that injects Proxy-Authorization into HTTPS CONNECT tunnel headers.
+
+    requests/urllib3 occasionally omits the auth header from the CONNECT
+    handshake when the proxy URL contains credentials, causing 407 errors.
+    Overriding proxy_headers() is the correct hook for this.
+    """
+
+    def __init__(self, proxy_auth: str | None = None, **kw):
+        self._proxy_auth = proxy_auth
+        super().__init__(**kw)
+
+    def proxy_headers(self, proxy: str) -> dict:
+        headers = super().proxy_headers(proxy)
+        if self._proxy_auth:
+            headers["Proxy-Authorization"] = self._proxy_auth
+        return headers
+
+
+def _proxy_auth_str(proxy: str) -> str | None:
+    """Return Basic auth header value for a proxy URL, or None if no credentials."""
+    parsed = urlparse(proxy)
+    if parsed.username:
+        creds = f"{parsed.username}:{parsed.password or ''}"
+        return "Basic " + base64.b64encode(creds.encode()).decode()
+    return None
+
 
 def _session(address: str, proxy: str | None = None) -> requests.Session:
     s = requests.Session()
@@ -54,8 +86,13 @@ def _session(address: str, proxy: str | None = None) -> requests.Session:
         }
     )
     if proxy:
+        proxy_auth = _proxy_auth_str(proxy)
+        adapter = _ProxyAuthAdapter(proxy_auth)
+        s.mount("http://", adapter)
+        s.mount("https://", adapter)
         s.proxies = {"http": proxy, "https": proxy}
-        logger.debug("Session for %s using proxy %s", address[:8], proxy.split("@")[-1])
+        short_addr = address[:8] if address else "anon"
+        logger.debug("Session for %s using proxy %s", short_addr, proxy.split("@")[-1])
     return s
 
 
@@ -157,8 +194,9 @@ def apply_referral(
 # Market selection
 # ---------------------------------------------------------------------------
 
-def fetch_events() -> list[dict[str, Any]]:
-    resp = requests.get(EVENTS_URL, timeout=REQUEST_TIMEOUT)
+def fetch_events(proxy: str | None = None) -> list[dict[str, Any]]:
+    s = _session("", proxy)
+    resp = s.get(EVENTS_URL, timeout=REQUEST_TIMEOUT)
     _raise_with_body(resp)
     return resp.json().get("data", [])
 
@@ -240,10 +278,17 @@ def create_free_parlay(
 
 
 def sign_transaction(tx_b64: str, keypair: Keypair) -> str:
-    """Deserialize, sign with keypair, return re-serialized base64 tx."""
+    """Deserialize, sign with keypair, return re-serialized base64 tx.
+
+    Uses VersionedTransaction.populate so any pre-existing server-side
+    signatures in the transaction are preserved (multi-signer flows).
+    The user keypair signs the raw serialized message bytes.
+    """
     raw = base64.b64decode(tx_b64)
     tx = VersionedTransaction.from_bytes(raw)
-    signed = VersionedTransaction(tx.message, [keypair])
+    msg_bytes = bytes(tx.message)
+    signature = keypair.sign_message(msg_bytes)
+    signed = VersionedTransaction.populate(tx.message, [signature])
     return base64.b64encode(bytes(signed)).decode()
 
 
@@ -273,13 +318,70 @@ def submit_free_parlay(
 
 
 # ---------------------------------------------------------------------------
+# Results
+# ---------------------------------------------------------------------------
+
+def fetch_wallet_slip(
+    address: str, proxy: str | None = None
+) -> tuple[str, list[dict[str, str]]]:
+    """Fetch parlay slip for a wallet. Returns (parlay_id, legs).
+
+    legs is a list of {eventId, marketId} dicts.
+    """
+    s = _session(address, proxy)
+    resp = s.get(_url(f"/parlays?walletAddress={address}"), timeout=REQUEST_TIMEOUT)
+    _raise_with_body(resp)
+    data = resp.json()
+    slips = data.get("slips") or data.get("parlays") or data.get("freerollSlips") or []
+    if not slips:
+        return "", []
+    slip = slips[0]
+    return slip.get("parlayId", ""), slip.get("legs", [])
+
+
+def fetch_event_score(
+    event_id: str, proxy: str | None = None
+) -> dict[str, Any] | None:
+    """Fetch score for one event. Returns None if the match has not been played yet."""
+    s = _session("", proxy)
+    resp = s.get(_url(f"/events/{event_id}/score"), timeout=REQUEST_TIMEOUT)
+    _raise_with_body(resp)
+    data = resp.json()
+    return data if data is not None else None
+
+
+def fetch_all_events_with_markets(proxy: str | None = None) -> list[dict[str, Any]]:
+    """Fetch all events (including closed) with full market data for result lookup."""
+    s = _session("", proxy)
+    resp = s.get(EVENTS_CLOSED_URL, timeout=REQUEST_TIMEOUT)
+    _raise_with_body(resp)
+    return resp.json().get("data", [])
+
+
+# ---------------------------------------------------------------------------
 # Slip check
 # ---------------------------------------------------------------------------
 
 def has_existing_slip(address: str) -> bool:
+    """Return True if the wallet already has a submitted parlay slip.
+
+    Checks multiple possible response field names since the API shape is
+    not always consistent. Logs the raw response at DEBUG level.
+    """
     resp = requests.get(
         _url(f"/parlays?walletAddress={address}"),
         timeout=REQUEST_TIMEOUT,
     )
     _raise_with_body(resp)
-    return bool(resp.json().get("slips", []))
+    data = resp.json()
+    logger.debug("has_existing_slip(%s…) response: %s", address[:8], data)
+
+    # Accept any non-empty list under common field names.
+    for key in ("slips", "parlays", "data", "freerollSlips"):
+        val = data.get(key)
+        if isinstance(val, list) and val:
+            return True
+    # Some APIs return a top-level list.
+    if isinstance(data, list) and data:
+        return True
+    return False
